@@ -1,41 +1,26 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-
-interface Container {
-  id: string
-  name: string
-  image: string
-  status: string
-  state: string
-  ports: string
-}
-
-interface Stats {
-  id: string
-  name: string
-  cpu: string
-  memUsage: string
-  memPerc: string
-  netIO: string
-  blockIO: string
-}
-
-interface Inspect {
-  id: string
-  created: string
-  startedAt: string
-  finishedAt: string
-  image: string
-  command: string
-  restartPolicy: string
-  networks: string
-  mounts: string
-  platform: string
-  sizeRw: string
-  sizeRootFs: string
-}
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  DockerContainer as Container,
+  DockerInspect as Inspect,
+  DockerStats as Stats,
+  OpenTerminal
+} from '../types'
+import { errorMessage } from '../lib/format'
+import { Icon, Spinner, useDialog, useToast } from './ui'
 
 interface Props {
   serverId: string
+  host: string
+  active: boolean
+  onOpenTerminal: OpenTerminal
+}
+
+type Action = 'start' | 'stop' | 'restart' | 'remove'
+
+function hostPorts(ports: string): number[] {
+  const found = new Set<number>()
+  for (const m of ports.matchAll(/:(\d+)->\d+\/tcp/g)) found.add(Number(m[1]))
+  return [...found].sort((a, b) => a - b)
 }
 
 function parsePerc(value?: string): number {
@@ -133,8 +118,9 @@ function Gauge({
   )
 }
 
-export default function DockerPanel({ serverId }: Props) {
+export default function DockerPanel({ serverId, host, active, onOpenTerminal }: Props) {
   const [available, setAvailable] = useState(true)
+  const [loaded, setLoaded] = useState(false)
   const [containers, setContainers] = useState<Container[]>([])
   const [stats, setStats] = useState<Stats[]>([])
   const [selected, setSelected] = useState<string | null>(null)
@@ -143,7 +129,14 @@ export default function DockerPanel({ serverId }: Props) {
   const [showLogs, setShowLogs] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<{ id: string; action: Action } | null>(null)
   const [logsBusy, setLogsBusy] = useState(false)
+  const [filter, setFilter] = useState('')
+  const [runningOnly, setRunningOnly] = useState(false)
+  const logsRef = useRef<HTMLPreElement>(null)
+  const loadedRef = useRef(false)
+  const toast = useToast()
+  const dialog = useDialog()
 
   const statsFor = useCallback(
     (id: string) => stats.find((s) => id.startsWith(s.id) || s.id.startsWith(id)),
@@ -157,34 +150,52 @@ export default function DockerPanel({ serverId }: Props) {
 
   const selectedStats = selected ? statsFor(selected) : undefined
 
-  const refresh = useCallback(async (opts?: { quiet?: boolean }) => {
-    if (!opts?.quiet) {
-      setBusy(true)
-      setError(null)
-    }
-    try {
-      const list = await window.api.docker.list(serverId)
-      setAvailable(list.available)
-      setContainers(list.containers)
-      if (list.error && !opts?.quiet) setError(list.error)
-      if (list.available) {
-        const s = await window.api.docker.stats(serverId)
-        setStats(s)
+  const visible = useMemo(() => {
+    const q = filter.trim().toLowerCase()
+    return containers
+      .filter((c) => !runningOnly || c.state === 'running')
+      .filter((c) => !q || c.name.toLowerCase().includes(q) || c.image.toLowerCase().includes(q))
+      .sort((a, b) => {
+        if (a.state === 'running' && b.state !== 'running') return -1
+        if (a.state !== 'running' && b.state === 'running') return 1
+        return a.name.localeCompare(b.name)
+      })
+  }, [containers, filter, runningOnly])
+
+  const refresh = useCallback(
+    async (opts?: { quiet?: boolean }) => {
+      if (!opts?.quiet) {
+        setBusy(true)
+        setError(null)
       }
-    } catch (e) {
-      if (!opts?.quiet) setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      if (!opts?.quiet) setBusy(false)
-    }
-  }, [serverId])
+      try {
+        const list = await window.api.docker.list(serverId)
+        setAvailable(list.available)
+        setContainers(list.containers)
+        if (list.error && !opts?.quiet) setError(list.error)
+        if (list.available) {
+          const s = await window.api.docker.stats(serverId)
+          setStats(s)
+        }
+      } catch (e) {
+        if (!opts?.quiet) setError(errorMessage(e))
+      } finally {
+        loadedRef.current = true
+        setLoaded(true)
+        if (!opts?.quiet) setBusy(false)
+      }
+    },
+    [serverId]
+  )
 
   useEffect(() => {
-    void refresh()
+    if (!active) return
+    void refresh({ quiet: loadedRef.current })
     const timer = setInterval(() => {
       void refresh({ quiet: true })
     }, 10000)
     return () => clearInterval(timer)
-  }, [refresh])
+  }, [refresh, active])
 
   useEffect(() => {
     if (selected && containers.length > 0 && !containers.some((c) => c.id === selected)) {
@@ -203,7 +214,7 @@ export default function DockerPanel({ serverId }: Props) {
     let cancelled = false
     void (async () => {
       try {
-        const info = (await window.api.docker.inspect(serverId, selected)) as Inspect | null
+        const info = await window.api.docker.inspect(serverId, selected)
         if (!cancelled) setInspect(info)
       } catch {
         if (!cancelled) setInspect(null)
@@ -214,20 +225,44 @@ export default function DockerPanel({ serverId }: Props) {
     }
   }, [serverId, selected])
 
-  const runAction = async (id: string, action: 'start' | 'stop' | 'restart' | 'remove') => {
-    setBusy(true)
-    const result = await window.api.docker.action(serverId, id, action)
-    if (!result.ok) setError(result.output || 'Action failed')
-    if (action === 'remove' && selected === id) {
-      setSelected(null)
-      setShowLogs(false)
-      setLogs('')
+  useEffect(() => {
+    if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight
+  }, [logs])
+
+  const runAction = async (container: Container, action: Action) => {
+    if (action === 'remove') {
+      const ok = await dialog.confirm({
+        title: `Remove ${container.name}?`,
+        message: 'The container will be force-removed. Volumes and images are kept.',
+        confirmLabel: 'Remove',
+        danger: true
+      })
+      if (!ok) return
     }
-    await refresh()
+    setPending({ id: container.id, action })
+    try {
+      const result = await window.api.docker.action(serverId, container.id, action)
+      if (!result.ok) {
+        toast({ kind: 'error', title: `Failed to ${action} ${container.name}`, detail: result.output })
+      } else {
+        const past = { start: 'Started', stop: 'Stopped', restart: 'Restarted', remove: 'Removed' }
+        toast({ kind: 'success', title: `${past[action]} ${container.name}` })
+      }
+      if (action === 'remove' && selected === container.id) {
+        setSelected(null)
+        setShowLogs(false)
+        setLogs('')
+      }
+    } catch (e) {
+      toast({ kind: 'error', title: `Failed to ${action} ${container.name}`, detail: errorMessage(e) })
+    } finally {
+      setPending(null)
+      await refresh({ quiet: true })
+    }
   }
 
   const selectContainer = (id: string) => {
-    setSelected(id)
+    setSelected((current) => (current === id ? null : id))
     setShowLogs(false)
     setLogs('')
   }
@@ -237,11 +272,29 @@ export default function DockerPanel({ serverId }: Props) {
     setShowLogs(true)
     setLogsBusy(true)
     try {
-      const text = await window.api.docker.logs(serverId, selected, 300)
+      const text = await window.api.docker.logs(serverId, selected, 500)
       setLogs(text)
+    } catch (e) {
+      setLogs(errorMessage(e))
     } finally {
       setLogsBusy(false)
     }
+  }
+
+  const openShell = (c: Container) => {
+    onOpenTerminal({
+      title: c.name,
+      command: `docker exec -it ${c.name} sh -c 'command -v bash >/dev/null && exec bash || exec sh'`,
+      su: true
+    })
+  }
+
+  const followLogs = (c: Container) => {
+    onOpenTerminal({
+      title: `logs: ${c.name}`,
+      command: `docker logs -f --tail 200 ${c.name}`,
+      su: true
+    })
   }
 
   const chartItems = useMemo(() => {
@@ -261,10 +314,22 @@ export default function DockerPanel({ serverId }: Props) {
       .sort((a, b) => b.cpu - a.cpu)
   }, [containers, statsFor])
 
+  if (!loaded) {
+    return (
+      <div className="panel">
+        <div className="empty">
+          <Spinner size={22} />
+          <p>Loading containers…</p>
+        </div>
+      </div>
+    )
+  }
+
   if (!available) {
     return (
       <div className="panel">
         <div className="empty">
+          <Icon name="docker" size={32} />
           <h2>Docker not found</h2>
           <p>This host does not appear to have the Docker CLI installed.</p>
         </div>
@@ -272,39 +337,60 @@ export default function DockerPanel({ serverId }: Props) {
     )
   }
 
+  const isPending = (id: string, action?: Action) =>
+    pending?.id === id && (!action || pending.action === action)
+
+  const ports = selectedContainer ? hostPorts(selectedContainer.ports) : []
+
   return (
     <div className="panel docker-panel">
       <div className="panel-toolbar">
         <strong>Containers</strong>
-        <span className="muted" style={{ fontSize: '0.85rem' }}>
-          {containers.length} total · {containers.filter((c) => c.state === 'running').length} running
+        <span className="muted small-text">
+          {containers.length} total · {containers.filter((c) => c.state === 'running').length}{' '}
+          running
         </span>
         <span className="spacer" />
+        <div className="search-box compact">
+          <Icon name="search" size={14} />
+          <input
+            type="text"
+            placeholder="Filter containers"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        </div>
+        <label className="check inline">
+          <input
+            type="checkbox"
+            checked={runningOnly}
+            onChange={(e) => setRunningOnly(e.target.checked)}
+          />
+          <span>Running only</span>
+        </label>
         <button className="btn" type="button" disabled={busy} onClick={() => void refresh()}>
+          {busy ? <Spinner /> : <Icon name="refresh" size={14} />}
           Refresh
         </button>
       </div>
 
-      {error && <div className="error-banner">{error}</div>}
+      {error && (
+        <div className="error-banner">
+          <Icon name="alert" size={14} />
+          <span>{error}</span>
+        </div>
+      )}
 
       <div className="usage-charts">
         <BarChart
           title="CPU usage"
           accent="var(--accent)"
-          items={chartItems.map((c) => ({
-            label: c.label,
-            value: c.cpu,
-            detail: c.cpuLabel
-          }))}
+          items={chartItems.map((c) => ({ label: c.label, value: c.cpu, detail: c.cpuLabel }))}
         />
         <BarChart
           title="Memory usage"
           accent="var(--warn)"
-          items={chartItems.map((c) => ({
-            label: c.label,
-            value: c.mem,
-            detail: c.memLabel
-          }))}
+          items={chartItems.map((c) => ({ label: c.label, value: c.mem, detail: c.memLabel }))}
         />
       </div>
 
@@ -315,10 +401,11 @@ export default function DockerPanel({ serverId }: Props) {
               <tr>
                 <th>Name</th>
                 <th>State</th>
+                <th className="actions-col" />
               </tr>
             </thead>
             <tbody>
-              {containers.map((c) => (
+              {visible.map((c) => (
                 <tr
                   key={c.id}
                   className={selected === c.id ? 'selected' : undefined}
@@ -326,16 +413,66 @@ export default function DockerPanel({ serverId }: Props) {
                 >
                   <td>
                     <div className="docker-name">{c.name}</div>
+                    <div className="muted mono docker-image">{c.image}</div>
                   </td>
                   <td>
-                    <span className={`status-pill ${c.state}`}>{c.state}</span>
+                    <span className={`status-pill ${c.state}`}>
+                      {isPending(c.id) ? <Spinner size={10} /> : null}
+                      {c.state}
+                    </span>
+                  </td>
+                  <td className="actions-col" onClick={(e) => e.stopPropagation()}>
+                    <div className="row-actions hover-actions">
+                      {c.state === 'running' ? (
+                        <>
+                          <button
+                            className="icon-btn"
+                            type="button"
+                            title="Open shell"
+                            onClick={() => openShell(c)}
+                          >
+                            <Icon name="terminal" size={14} />
+                          </button>
+                          <button
+                            className="icon-btn"
+                            type="button"
+                            title="Restart"
+                            disabled={!!pending}
+                            onClick={() => void runAction(c, 'restart')}
+                          >
+                            <Icon name="restart" size={14} />
+                          </button>
+                          <button
+                            className="icon-btn"
+                            type="button"
+                            title="Stop"
+                            disabled={!!pending}
+                            onClick={() => void runAction(c, 'stop')}
+                          >
+                            <Icon name="stop" size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="icon-btn"
+                          type="button"
+                          title="Start"
+                          disabled={!!pending}
+                          onClick={() => void runAction(c, 'start')}
+                        >
+                          <Icon name="play" size={14} />
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
-              {containers.length === 0 && (
+              {visible.length === 0 && (
                 <tr>
-                  <td colSpan={2} className="muted">
-                    No containers found.
+                  <td colSpan={3} className="muted">
+                    {containers.length === 0
+                      ? 'No containers found.'
+                      : 'No containers match the filter.'}
                   </td>
                 </tr>
               )}
@@ -356,51 +493,117 @@ export default function DockerPanel({ serverId }: Props) {
               <span className={`status-pill ${selectedContainer.state}`}>
                 {selectedContainer.state}
               </span>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Close details"
+                onClick={() => setSelected(null)}
+              >
+                <Icon name="x" size={14} />
+              </button>
             </div>
 
             <div className="row-actions" style={{ marginBottom: '0.85rem' }}>
               {selectedContainer.state === 'running' ? (
                 <>
+                  <button className="btn" type="button" onClick={() => openShell(selectedContainer)}>
+                    <Icon name="terminal" size={14} /> Shell
+                  </button>
                   <button
                     className="btn"
                     type="button"
-                    onClick={() => runAction(selectedContainer.id, 'stop')}
+                    disabled={!!pending}
+                    onClick={() => void runAction(selectedContainer, 'stop')}
                   >
+                    {isPending(selectedContainer.id, 'stop') ? (
+                      <Spinner />
+                    ) : (
+                      <Icon name="stop" size={14} />
+                    )}
                     Stop
                   </button>
                   <button
                     className="btn"
                     type="button"
-                    onClick={() => runAction(selectedContainer.id, 'restart')}
+                    disabled={!!pending}
+                    onClick={() => void runAction(selectedContainer, 'restart')}
                   >
+                    {isPending(selectedContainer.id, 'restart') ? (
+                      <Spinner />
+                    ) : (
+                      <Icon name="restart" size={14} />
+                    )}
                     Restart
                   </button>
                 </>
               ) : (
                 <button
-                  className="btn"
+                  className="btn primary"
                   type="button"
-                  onClick={() => runAction(selectedContainer.id, 'start')}
+                  disabled={!!pending}
+                  onClick={() => void runAction(selectedContainer, 'start')}
                 >
+                  {isPending(selectedContainer.id, 'start') ? (
+                    <Spinner />
+                  ) : (
+                    <Icon name="play" size={14} />
+                  )}
                   Start
                 </button>
               )}
               <button
-                className="btn danger"
-                type="button"
-                onClick={() => runAction(selectedContainer.id, 'remove')}
-              >
-                Remove
-              </button>
-              <button
                 className="btn"
                 type="button"
                 disabled={logsBusy}
-                onClick={() => (showLogs ? setShowLogs(false) : viewLogs())}
+                onClick={() => (showLogs ? setShowLogs(false) : void viewLogs())}
               >
+                <Icon name="logs" size={14} />
                 {showLogs ? 'Hide logs' : 'Logs'}
               </button>
+              <button className="btn" type="button" onClick={() => followLogs(selectedContainer)}>
+                <Icon name="terminal" size={14} /> Follow logs
+              </button>
+              <button
+                className="btn danger"
+                type="button"
+                disabled={!!pending}
+                onClick={() => void runAction(selectedContainer, 'remove')}
+              >
+                <Icon name="trash" size={14} /> Remove
+              </button>
             </div>
+
+            {showLogs && (
+              <div className="docker-logs">
+                <div className="panel-toolbar" style={{ marginBottom: '0.5rem' }}>
+                  <strong>Logs</strong>
+                  <span className="muted small-text">last 500 lines</span>
+                  <span className="spacer" />
+                  <button
+                    className="btn small"
+                    type="button"
+                    disabled={!logs}
+                    onClick={() => {
+                      window.api.clipboard.writeText(logs)
+                      toast({ kind: 'success', title: 'Logs copied' })
+                    }}
+                  >
+                    <Icon name="copy" size={12} /> Copy
+                  </button>
+                  <button
+                    className="btn small"
+                    type="button"
+                    disabled={logsBusy}
+                    onClick={() => void viewLogs()}
+                  >
+                    <Icon name="refresh" size={12} /> Reload
+                  </button>
+                </div>
+                <pre className="pre logs" ref={logsRef}>
+                  {logsBusy && !logs ? 'Loading…' : logs || 'No log output.'}
+                </pre>
+              </div>
+            )}
 
             {selectedStats && (
               <div className="gauge-row">
@@ -430,7 +633,25 @@ export default function DockerPanel({ serverId }: Props) {
               </div>
               <div className="detail-item">
                 <div className="label">Ports</div>
-                <div className="mono">{selectedContainer.ports || '—'}</div>
+                <div className="mono">
+                  {ports.length > 0 ? (
+                    <div className="port-links">
+                      {ports.map((port) => (
+                        <a
+                          key={port}
+                          href={`http://${host}:${port}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={`Open http://${host}:${port}`}
+                        >
+                          {port} <Icon name="external" size={11} />
+                        </a>
+                      ))}
+                    </div>
+                  ) : (
+                    selectedContainer.ports || '—'
+                  )}
+                </div>
               </div>
               <div className="detail-item">
                 <div className="label">Networks</div>
@@ -473,19 +694,6 @@ export default function DockerPanel({ serverId }: Props) {
                 <div className="mono">{inspect?.mounts || '—'}</div>
               </div>
             </div>
-
-            {showLogs && (
-              <div className="docker-logs">
-                <div className="panel-toolbar" style={{ marginBottom: '0.5rem' }}>
-                  <strong>Logs</strong>
-                  <span className="spacer" />
-                  <button className="btn" type="button" disabled={logsBusy} onClick={viewLogs}>
-                    Reload
-                  </button>
-                </div>
-                <pre className="pre logs">{logsBusy ? 'Loading…' : logs || 'No log output.'}</pre>
-              </div>
-            )}
           </div>
         )}
       </div>

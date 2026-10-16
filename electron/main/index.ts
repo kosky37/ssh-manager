@@ -1,26 +1,93 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, nativeImage } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, Menu, nativeImage, screen } from 'electron'
 import { basename, join } from 'path'
-import { mkdirSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { ClientChannel } from 'ssh2'
 import icon from '../../resources/icon.png?asset'
 import { sessionManager } from './ssh/manager'
+import { shellQuote } from './ssh/elevate'
 import * as docker from './ssh/docker'
 import * as tailscale from './ssh/tailscale'
 import * as system from './ssh/system'
 import * as files from './ssh/files'
-import type { ServerConfig } from './types'
+import type { ServerInput } from './types'
+
+app.setPath('userData', join(app.getPath('appData'), 'ssh-manager'))
 
 const dragIcon = nativeImage.createFromPath(icon).resize({ width: 32, height: 32 })
 
-const shells = new Map<string, ClientChannel>()
+interface ShellEntry {
+  serverId: string
+  stream: ClientChannel
+}
+
+const shells = new Map<string, ShellEntry>()
+let mainWindow: BrowserWindow | null = null
+
+interface WindowState {
+  x?: number
+  y?: number
+  width: number
+  height: number
+  maximized: boolean
+}
+
+function windowStatePath(): string {
+  return join(app.getPath('userData'), 'window-state.json')
+}
+
+function loadWindowState(): WindowState {
+  const fallback: WindowState = { width: 1400, height: 900, maximized: false }
+  try {
+    const path = windowStatePath()
+    if (!existsSync(path)) return fallback
+    const state = { ...fallback, ...JSON.parse(readFileSync(path, 'utf-8')) } as WindowState
+    if (state.x !== undefined && state.y !== undefined) {
+      const visible = screen.getAllDisplays().some(({ workArea: a }) => {
+        return (
+          state.x! < a.x + a.width - 100 &&
+          state.x! + state.width > a.x + 100 &&
+          state.y! >= a.y - 10 &&
+          state.y! < a.y + a.height - 100
+        )
+      })
+      if (!visible) {
+        delete state.x
+        delete state.y
+      }
+    }
+    return state
+  } catch {
+    return fallback
+  }
+}
+
+function saveWindowState(win: BrowserWindow): void {
+  try {
+    const bounds = win.getNormalBounds()
+    const state: WindowState = { ...bounds, maximized: win.isMaximized() }
+    mkdirSync(app.getPath('userData'), { recursive: true })
+    writeFileSync(windowStatePath(), JSON.stringify(state), 'utf-8')
+  } catch {
+    return
+  }
+}
+
+function send(channel: string, payload: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload)
+  }
+}
 
 function createWindow(): void {
+  const state = loadWindowState()
   const win = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1000,
-    minHeight: 700,
+    x: state.x,
+    y: state.y,
+    width: state.width,
+    height: state.height,
+    minWidth: 900,
+    minHeight: 600,
     show: false,
     title: 'SSH Manager',
     icon,
@@ -33,12 +100,38 @@ function createWindow(): void {
       sandbox: false
     }
   })
+  mainWindow = win
+  win.setMenuBarVisibility(false)
 
-  win.on('ready-to-show', () => win.show())
+  win.on('ready-to-show', () => {
+    if (state.maximized) win.maximize()
+    win.show()
+  })
+
+  win.on('close', () => saveWindowState(win))
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null
+  })
 
   win.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (/^https?:\/\//i.test(details.url)) shell.openExternal(details.url)
     return { action: 'deny' }
+  })
+
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url !== win.webContents.getURL()) {
+      event.preventDefault()
+      if (/^https?:\/\//i.test(url)) shell.openExternal(url)
+    }
+  })
+
+  win.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return
+    const key = input.key.toLowerCase()
+    if ((input.control || input.meta) && input.shift && key === 'i') {
+      win.webContents.toggleDevTools()
+      event.preventDefault()
+    }
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -48,26 +141,67 @@ function createWindow(): void {
   }
 }
 
+function closeShellsFor(serverId: string): void {
+  for (const [termId, entry] of shells) {
+    if (entry.serverId === serverId) {
+      shells.delete(termId)
+      entry.stream.close()
+      send('terminal:closed', { termId })
+    }
+  }
+}
+
 function registerIpc(): void {
-  ipcMain.handle('servers:list', () => {
-    return sessionManager.getServers().map((s) => ({
-      ...s,
-      password: s.password ? '••••••' : undefined,
-      connected: sessionManager.isConnected(s.id)
-    }))
+  sessionManager.on('status', (payload: { serverId: string; connected: boolean; lost?: boolean }) => {
+    if (!payload.connected) closeShellsFor(payload.serverId)
+    send('servers:status', payload)
   })
 
-  ipcMain.handle('servers:save', (_e, servers: ServerConfig[]) => {
-    const existing = sessionManager.getServers()
-    const merged = servers.map((s) => {
-      const prev = existing.find((p) => p.id === s.id)
-      if (s.password === '••••••' && prev?.password) {
-        return { ...s, password: prev.password }
-      }
-      return s
-    })
-    sessionManager.saveServers(merged)
+  sessionManager.on('changed', () => {
+    send('servers:changed', null)
+  })
+
+  ipcMain.handle('servers:list', () => sessionManager.listInfo())
+
+  ipcMain.handle('servers:upsert', (_e, input: ServerInput) => sessionManager.upsert(input))
+
+  ipcMain.handle('servers:remove', (_e, serverId: string) => {
+    sessionManager.remove(serverId)
     return true
+  })
+
+  ipcMain.handle('servers:reorder', (_e, ids: string[]) => {
+    sessionManager.reorder(ids)
+    return true
+  })
+
+  ipcMain.handle('servers:test', (_e, input: ServerInput) => sessionManager.test(input))
+
+  ipcMain.handle('servers:import', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Import servers',
+      filters: [{ name: 'Server list', extensions: ['json'] }],
+      properties: ['openFile']
+    })
+    if (result.canceled || result.filePaths.length === 0) return { ok: false, count: 0 }
+    const count = sessionManager.importFrom(result.filePaths[0])
+    return { ok: count > 0, count }
+  })
+
+  ipcMain.handle('servers:openConfigDir', () => {
+    shell.showItemInFolder(sessionManager.configFile)
+    return true
+  })
+
+  ipcMain.handle('servers:pickKey', async () => {
+    const sshDir = join(app.getPath('home'), '.ssh')
+    const result = await dialog.showOpenDialog({
+      title: 'Select private key',
+      defaultPath: existsSync(sshDir) ? sshDir : app.getPath('home'),
+      properties: ['openFile', 'showHiddenFiles']
+    })
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
   })
 
   ipcMain.handle('servers:connect', async (_e, serverId: string) => {
@@ -75,11 +209,7 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('servers:disconnect', (_e, serverId: string) => {
-    const shellKey = [...shells.keys()].filter((k) => k.startsWith(`${serverId}:`))
-    for (const key of shellKey) {
-      shells.get(key)?.close()
-      shells.delete(key)
-    }
+    closeShellsFor(serverId)
     sessionManager.disconnect(serverId)
     return true
   })
@@ -90,53 +220,62 @@ function registerIpc(): void {
       _e,
       serverId: string,
       termId: string,
-      opts: { cols: number; rows: number; su: boolean }
+      opts: { cols: number; rows: number; su: boolean; command?: string; cwd?: string }
     ) => {
       const session = sessionManager.getSession(serverId)
       const stream = await session.shell(opts.cols, opts.rows)
-      const key = `${serverId}:${termId}`
-      shells.set(key, stream)
-
-      const win = BrowserWindow.getAllWindows()[0]
+      shells.set(termId, { serverId, stream })
 
       stream.on('data', (data: Buffer) => {
-        win?.webContents.send('terminal:data', { termId, data: data.toString('base64') })
+        send('terminal:data', { termId, data: data.toString('base64') })
       })
 
       stream.on('close', () => {
-        // Only clear if this stream still owns the slot — a remount can open a
-        // new shell under the same key before the old close event arrives.
-        if (shells.get(key) === stream) {
-          shells.delete(key)
-          win?.webContents.send('terminal:closed', { termId })
+        if (shells.get(termId)?.stream === stream) {
+          shells.delete(termId)
+          send('terminal:closed', { termId })
         }
       })
 
+      const followUp = [
+        opts.cwd ? `cd ${shellQuote(opts.cwd)}` : '',
+        opts.command || ''
+      ]
+        .filter(Boolean)
+        .join(' && ')
+
+      let followUpSent = false
+      const sendFollowUp = (delay: number): void => {
+        if (followUpSent || !followUp) return
+        followUpSent = true
+        setTimeout(() => {
+          if (shells.get(termId)?.stream === stream) stream.write(`${followUp}\n`)
+        }, delay)
+      }
+
       if (opts.su && session.config.username !== 'root') {
-        // Elevate to root; feed stored password when sudo asks for it.
         let pendingPassword = session.config.password || ''
         let passwordSent = false
-        const onPrompt = (data: Buffer) => {
+        const onPrompt = (data: Buffer): void => {
           if (passwordSent || !pendingPassword) return
           const text = data.toString('utf8').toLowerCase()
-          if (
-            text.includes('password') ||
-            text.includes('[sudo]') ||
-            text.includes('passwort')
-          ) {
+          if (text.includes('password') || text.includes('[sudo]') || text.includes('passwort')) {
             passwordSent = true
             stream.write(`${pendingPassword}\n`)
             pendingPassword = ''
             stream.removeListener('data', onPrompt)
+            sendFollowUp(600)
           }
         }
         stream.on('data', onPrompt)
         stream.write('sudo -i\n')
-        // Stop watching after a short window if no prompt appeared.
+        setTimeout(() => sendFollowUp(0), 2500)
         setTimeout(() => {
           stream.removeListener('data', onPrompt)
           pendingPassword = ''
         }, 8000)
+      } else {
+        sendFollowUp(150)
       }
 
       return { ok: true }
@@ -144,33 +283,18 @@ function registerIpc(): void {
   )
 
   ipcMain.on('terminal:input', (_e, payload: { termId: string; data: string }) => {
-    for (const [key, stream] of shells) {
-      if (key.endsWith(`:${payload.termId}`)) {
-        stream.write(Buffer.from(payload.data, 'base64'))
-        break
-      }
-    }
+    shells.get(payload.termId)?.stream.write(Buffer.from(payload.data, 'base64'))
   })
 
-  ipcMain.on(
-    'terminal:resize',
-    (_e, payload: { termId: string; cols: number; rows: number }) => {
-      for (const [key, stream] of shells) {
-        if (key.endsWith(`:${payload.termId}`)) {
-          stream.setWindow(payload.rows, payload.cols, 0, 0)
-          break
-        }
-      }
-    }
-  )
+  ipcMain.on('terminal:resize', (_e, payload: { termId: string; cols: number; rows: number }) => {
+    shells.get(payload.termId)?.stream.setWindow(payload.rows, payload.cols, 0, 0)
+  })
 
   ipcMain.handle('terminal:close', (_e, termId: string) => {
-    for (const [key, stream] of shells) {
-      if (key.endsWith(`:${termId}`)) {
-        stream.close()
-        shells.delete(key)
-        break
-      }
+    const entry = shells.get(termId)
+    if (entry) {
+      shells.delete(termId)
+      entry.stream.close()
     }
     return true
   })
@@ -190,12 +314,9 @@ function registerIpc(): void {
     }
   )
 
-  ipcMain.handle(
-    'docker:inspect',
-    async (_e, serverId: string, containerId: string) => {
-      return docker.containerInspect(sessionManager.getSession(serverId), containerId)
-    }
-  )
+  ipcMain.handle('docker:inspect', async (_e, serverId: string, containerId: string) => {
+    return docker.containerInspect(sessionManager.getSession(serverId), containerId)
+  })
 
   ipcMain.handle(
     'docker:action',
@@ -229,11 +350,7 @@ function registerIpc(): void {
       setting: 'accept-routes' | 'accept-dns' | 'ssh' | 'advertise-exit-node',
       enabled: boolean
     ) => {
-      return tailscale.setTailscaleSetting(
-        sessionManager.getSession(serverId),
-        setting,
-        enabled
-      )
+      return tailscale.setTailscaleSetting(sessionManager.getSession(serverId), setting, enabled)
     }
   )
 
@@ -261,12 +378,9 @@ function registerIpc(): void {
     return files.resolveHome(sessionManager.getSession(serverId))
   })
 
-  ipcMain.handle(
-    'files:chmod',
-    async (_e, serverId: string, path: string, mode: string) => {
-      return files.chmod(sessionManager.getSession(serverId), path, mode)
-    }
-  )
+  ipcMain.handle('files:chmod', async (_e, serverId: string, path: string, mode: string) => {
+    return files.chmod(sessionManager.getSession(serverId), path, mode)
+  })
 
   ipcMain.handle(
     'files:chown',
@@ -279,27 +393,32 @@ function registerIpc(): void {
     return files.mkdir(sessionManager.getSession(serverId), path)
   })
 
+  ipcMain.handle('files:touch', async (_e, serverId: string, path: string) => {
+    return files.writeEmptyFile(sessionManager.getSession(serverId), path)
+  })
+
   ipcMain.handle('files:remove', async (_e, serverId: string, path: string) => {
     return files.removePath(sessionManager.getSession(serverId), path)
   })
 
   ipcMain.handle(
-    'files:copy',
-    async (_e, serverId: string, sourcePath: string, destDir: string) => {
-      return files.copyPath(sessionManager.getSession(serverId), sourcePath, destDir)
+    'files:rename',
+    async (_e, serverId: string, sourcePath: string, targetPath: string) => {
+      return files.renamePath(sessionManager.getSession(serverId), sourcePath, targetPath)
     }
   )
 
-  ipcMain.handle(
-    'files:move',
-    async (_e, serverId: string, sourcePath: string, destDir: string) => {
-      return files.movePath(sessionManager.getSession(serverId), sourcePath, destDir)
-    }
-  )
+  ipcMain.handle('files:copy', async (_e, serverId: string, sourcePath: string, destDir: string) => {
+    return files.copyPath(sessionManager.getSession(serverId), sourcePath, destDir)
+  })
+
+  ipcMain.handle('files:move', async (_e, serverId: string, sourcePath: string, destDir: string) => {
+    return files.movePath(sessionManager.getSession(serverId), sourcePath, destDir)
+  })
 
   ipcMain.handle('files:download', async (_e, serverId: string, remotePath: string) => {
     const result = await dialog.showSaveDialog({
-      defaultPath: remotePath.split('/').pop() || 'download'
+      defaultPath: join(app.getPath('downloads'), remotePath.split('/').pop() || 'download')
     })
     if (result.canceled || !result.filePath) {
       return { ok: false, canceled: true }
@@ -308,12 +427,9 @@ function registerIpc(): void {
     return { ok: true, localPath: result.filePath }
   })
 
-  ipcMain.handle('files:downloadTemp', async (_e, serverId: string, remotePath: string) => {
-    const dir = join(tmpdir(), 'ssh-manager-drag')
-    mkdirSync(dir, { recursive: true })
-    const localPath = join(dir, basename(remotePath) || 'download')
-    await files.downloadFile(sessionManager.getSession(serverId), remotePath, localPath)
-    return { ok: true, localPath }
+  ipcMain.handle('files:showLocal', (_e, localPath: string) => {
+    shell.showItemInFolder(localPath)
+    return true
   })
 
   ipcMain.handle('files:upload', async (_e, serverId: string, remoteDir: string) => {
@@ -343,47 +459,45 @@ function registerIpc(): void {
     }
   )
 
-  ipcMain.on('files:start-drag', (event, localPath: string) => {
-    if (!localPath) return
-    event.sender.startDrag({
-      file: localPath,
-      icon: dragIcon
+  ipcMain.on('files:drag-out', async (event, serverId: string, remotePath: string) => {
+    try {
+      const dir = join(tmpdir(), 'ssh-manager-drag')
+      mkdirSync(dir, { recursive: true })
+      const localPath = join(dir, basename(remotePath) || 'download')
+      await files.downloadFile(sessionManager.getSession(serverId), remotePath, localPath)
+      event.sender.startDrag({ file: localPath, icon: dragIcon })
+    } catch {
+      return
+    }
+  })
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+  })
+
+  app.whenReady().then(() => {
+    if (process.platform === 'win32') {
+      app.setAppUserModelId('com.kosky37.ssh-manager')
+    }
+    Menu.setApplicationMenu(null)
+    sessionManager.loadServers()
+    registerIpc()
+    createWindow()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
   })
 
-  ipcMain.on(
-    'files:drag-out',
-    async (event, serverId: string, remotePath: string) => {
-      try {
-        const dir = join(tmpdir(), 'ssh-manager-drag')
-        mkdirSync(dir, { recursive: true })
-        const localPath = join(dir, basename(remotePath) || 'download')
-        await files.downloadFile(sessionManager.getSession(serverId), remotePath, localPath)
-        event.sender.startDrag({
-          file: localPath,
-          icon: dragIcon
-        })
-      } catch {
-        // Drag cancelled or download failed; renderer shows status separately.
-      }
-    }
-  )
-}
-
-app.whenReady().then(() => {
-  if (process.platform === 'win32') {
-    app.setAppUserModelId('com.ssh-manager.app')
-  }
-  sessionManager.loadServers()
-  registerIpc()
-  createWindow()
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  app.on('window-all-closed', () => {
+    sessionManager.disconnectAll()
+    if (process.platform !== 'darwin') app.quit()
   })
-})
-
-app.on('window-all-closed', () => {
-  sessionManager.disconnectAll()
-  if (process.platform !== 'darwin') app.quit()
-})
+}

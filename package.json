@@ -2,29 +2,85 @@
   "name": "ssh-manager",
   "version": "1.0.0",
   "description": "SSH remote machine manager with Docker, Tailscale, and file management",
+  "author": "Piotr Nowakowski",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kosky37/ssh-manager.git"
+  },
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "dist:win": "electron-vite build && electron-builder --win --publish never"
   },
   "dependencies": {
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/addon-web-links": "^0.11.0",
-    "ssh2": "^1.16.0",
-    "xterm": "^5.3.0"
+    "ssh2": "^1.16.0"
   },
   "devDependencies": {
+    "@fontsource/ibm-plex-mono": "^5",
+    "@fontsource/outfit": "^5",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@types/ssh2": "^1.15.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
     "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.kosky37.ssh-manager",
+    "productName": "SSH Manager",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "resources/**"
+    ],
+    "npmRebuild": false,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "SSH Manager",
+      "artifactName": "SSH-Manager-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "SSH-Manager-${version}-portable.${ext}"
+    }
   }
 }

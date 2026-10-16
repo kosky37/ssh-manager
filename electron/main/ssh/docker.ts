@@ -1,6 +1,6 @@
 import type { SshSession } from './session'
 import type { DockerContainer, DockerInspect, DockerStats, ExecResult } from '../types'
-import { isRootUser, sudoExec } from './elevate'
+import { isRootUser, shellQuote, sudoExec } from './elevate'
 
 type DockerMode = 'plain' | 'sudo'
 
@@ -143,7 +143,7 @@ export async function containerLogs(
 ): Promise<string> {
   const result = await dockerExec(
     session,
-    `logs --tail ${lines} ${JSON.stringify(containerId)} 2>&1`
+    `logs --tail ${lines} ${shellQuote(containerId)} 2>&1`
   )
   return result.stdout || result.stderr
 }
@@ -169,7 +169,7 @@ export async function containerInspect(
 
   const result = await dockerExec(
     session,
-    `inspect --size --format '${fmt}' ${JSON.stringify(containerId)}`
+    `inspect --size --format '${fmt}' ${shellQuote(containerId)}`
   )
   if (result.code !== 0) return null
 
@@ -214,8 +214,8 @@ export async function containerAction(
 ): Promise<{ ok: boolean; output: string }> {
   const args =
     action === 'remove'
-      ? `rm -f ${JSON.stringify(containerId)}`
-      : `${action} ${JSON.stringify(containerId)}`
+      ? `rm -f ${shellQuote(containerId)}`
+      : `${action} ${shellQuote(containerId)}`
   const result = await dockerExec(session, args)
   return {
     ok: result.code === 0,

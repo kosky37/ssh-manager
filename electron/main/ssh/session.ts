@@ -1,5 +1,6 @@
 import { Client, ClientChannel, SFTPWrapper } from 'ssh2'
 import { readFileSync } from 'fs'
+import { homedir } from 'os'
 import { resolve } from 'path'
 import type { ExecResult, ServerConfig } from '../types'
 
@@ -11,6 +12,7 @@ export class SshSession {
   /** Reused across file ops — opening a new SFTP channel per call exhausts MaxSessions. */
   private sftpSession: SFTPWrapper | null = null
   private sftpOpening: Promise<SFTPWrapper> | null = null
+  private closeListeners = new Set<() => void>()
 
   constructor(config: ServerConfig) {
     this.id = config.id
@@ -19,6 +21,11 @@ export class SshSession {
 
   get isConnected(): boolean {
     return this.connected
+  }
+
+  onClose(listener: () => void): () => void {
+    this.closeListeners.add(listener)
+    return () => this.closeListeners.delete(listener)
   }
 
   connect(): Promise<void> {
@@ -43,8 +50,12 @@ export class SshSession {
       })
 
       client.on('close', () => {
+        const wasConnected = this.connected
         this.connected = false
         this.clearSftp()
+        if (wasConnected && this.client === client) {
+          for (const listener of this.closeListeners) listener()
+        }
       })
 
       const connectOpts: Record<string, unknown> = {
@@ -57,8 +68,18 @@ export class SshSession {
       }
 
       if (this.config.authType === 'privateKey') {
-        const keyPath = resolve(process.cwd(), this.config.privateKeyPath || '')
-        connectOpts.privateKey = readFileSync(keyPath)
+        const raw = (this.config.privateKeyPath || '').trim()
+        if (!raw) {
+          reject(new Error('No private key file configured'))
+          return
+        }
+        const keyPath = resolve(raw.replace(/^~(?=$|[\\/])/, homedir()))
+        try {
+          connectOpts.privateKey = readFileSync(keyPath)
+        } catch {
+          reject(new Error(`Cannot read private key: ${keyPath}`))
+          return
+        }
         if (this.config.passphrase) {
           connectOpts.passphrase = this.config.passphrase
         }
@@ -72,11 +93,10 @@ export class SshSession {
 
   disconnect(): void {
     this.clearSftp()
-    if (this.client) {
-      this.client.end()
-      this.client = null
-    }
+    const client = this.client
+    this.client = null
     this.connected = false
+    client?.end()
   }
 
   private clearSftp(): void {

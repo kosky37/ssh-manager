@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
     "composite": true,
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
@@ -17,6 +19,7 @@
   "include": [
     "src/renderer/src/**/*",
     "src/renderer/src/**/*.tsx",
-    "electron/preload/index.d.ts"
+    "electron/preload/index.ts",
+    "electron/main/types.ts"
   ]
 }

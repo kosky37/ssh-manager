@@ -2,6 +2,7 @@ import { createWriteStream, createReadStream } from 'fs'
 import { basename, posix } from 'path'
 import type { SshSession } from './session'
 import type { FileEntry, NamedAccount } from '../types'
+import { shellQuote } from './elevate'
 
 type IdMaps = {
   users: Map<string, string>
@@ -184,7 +185,7 @@ export async function chmod(
   mode: string
 ): Promise<{ ok: boolean; output: string }> {
   const result = await session.exec(
-    `chmod ${JSON.stringify(mode)} -- ${JSON.stringify(remotePath)} 2>&1`
+    `chmod ${shellQuote(mode)} -- ${shellQuote(remotePath)} 2>&1`
   )
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }
@@ -197,7 +198,7 @@ export async function chown(
 ): Promise<{ ok: boolean; output: string }> {
   const spec = group ? `${owner}:${group}` : owner
   const result = await session.exec(
-    `chown ${JSON.stringify(spec)} -- ${JSON.stringify(remotePath)} 2>&1`
+    `chown ${shellQuote(spec)} -- ${shellQuote(remotePath)} 2>&1`
   )
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }
@@ -206,7 +207,7 @@ export async function mkdir(
   session: SshSession,
   remotePath: string
 ): Promise<{ ok: boolean; output: string }> {
-  const result = await session.exec(`mkdir -p -- ${JSON.stringify(remotePath)} 2>&1`)
+  const result = await session.exec(`mkdir -p -- ${shellQuote(remotePath)} 2>&1`)
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }
 
@@ -214,7 +215,28 @@ export async function removePath(
   session: SshSession,
   remotePath: string
 ): Promise<{ ok: boolean; output: string }> {
-  const result = await session.exec(`rm -rf -- ${JSON.stringify(remotePath)} 2>&1`)
+  const result = await session.exec(`rm -rf -- ${shellQuote(remotePath)} 2>&1`)
+  return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
+}
+
+export async function renamePath(
+  session: SshSession,
+  sourcePath: string,
+  targetPath: string
+): Promise<{ ok: boolean; output: string }> {
+  const result = await session.exec(
+    `[ -e ${shellQuote(targetPath)} ] && echo 'Target already exists' && exit 1; mv -- ${shellQuote(sourcePath)} ${shellQuote(targetPath)} 2>&1`
+  )
+  return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
+}
+
+export async function writeEmptyFile(
+  session: SshSession,
+  remotePath: string
+): Promise<{ ok: boolean; output: string }> {
+  const result = await session.exec(
+    `[ -e ${shellQuote(remotePath)} ] && echo 'File already exists' && exit 1; : > ${shellQuote(remotePath)} 2>&1`
+  )
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }
 
@@ -225,7 +247,7 @@ export async function copyPath(
 ): Promise<{ ok: boolean; output: string }> {
   const dest = destDir.endsWith('/') ? destDir : `${destDir}/`
   const result = await session.exec(
-    `cp -a -- ${JSON.stringify(sourcePath)} ${JSON.stringify(dest)} 2>&1`
+    `cp -a -- ${shellQuote(sourcePath)} ${shellQuote(dest)} 2>&1`
   )
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }
@@ -237,7 +259,7 @@ export async function movePath(
 ): Promise<{ ok: boolean; output: string }> {
   const dest = destDir.endsWith('/') ? destDir : `${destDir}/`
   const result = await session.exec(
-    `mv -- ${JSON.stringify(sourcePath)} ${JSON.stringify(dest)} 2>&1`
+    `mv -- ${shellQuote(sourcePath)} ${shellQuote(dest)} 2>&1`
   )
   return { ok: result.code === 0, output: (result.stdout || result.stderr).trim() }
 }

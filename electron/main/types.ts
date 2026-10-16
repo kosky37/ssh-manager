@@ -10,6 +10,39 @@ export interface ServerConfig {
   password?: string
   privateKeyPath?: string
   passphrase?: string
+  elevate?: boolean
+}
+
+export interface ServerInfo {
+  id: string
+  name: string
+  host: string
+  port: number
+  username: string
+  authType: AuthType
+  privateKeyPath?: string
+  hasPassword: boolean
+  hasPassphrase: boolean
+  elevate: boolean
+  connected: boolean
+}
+
+export interface ServerInput {
+  id?: string
+  name: string
+  host: string
+  port: number
+  username: string
+  authType: AuthType
+  password?: string
+  privateKeyPath?: string
+  passphrase?: string
+  elevate?: boolean
+}
+
+export interface OpResult {
+  ok: boolean
+  output: string
 }
 
 export interface ExecResult {
@@ -77,19 +110,45 @@ export interface DockerInspect {
   sizeRootFs: string
 }
 
+export interface DiskUsage {
+  filesystem: string
+  size: number
+  used: number
+  available: number
+  mount: string
+}
+
+export interface ProcessInfo {
+  user: string
+  pid: string
+  cpu: number
+  mem: number
+  command: string
+}
+
 export interface SystemResources {
   hostname: string
+  os: string
+  kernel: string
   uptime: string
-  loadAvg: string
+  loadAvg: number[]
   cpuModel: string
-  cpuCores: string
-  memTotal: string
-  memUsed: string
-  memAvailable: string
-  swapTotal: string
-  swapUsed: string
-  disk: string
-  topProcesses: string
+  cpuCores: number
+  cpuUsage: number | null
+  memTotal: number
+  memUsed: number
+  memAvailable: number
+  swapTotal: number
+  swapUsed: number
+  disks: DiskUsage[]
+  processes: ProcessInfo[]
+}
+
+export interface TailscalePrefs {
+  acceptRoutes: boolean | null
+  acceptDns: boolean | null
+  ssh: boolean | null
+  exitNode: boolean | null
 }
 
 export interface TailscaleStatus {
@@ -97,6 +156,7 @@ export interface TailscaleStatus {
   version: string | null
   statusJson: string | null
   rawStatus: string | null
+  prefs: TailscalePrefs | null
   error?: string
 }
 

@@ -1,4 +1,4 @@
-import type { SshManagerApi } from './index'
+import type { SshManagerApi } from '../../../electron/preload/index'
 
 declare global {
   interface Window {
