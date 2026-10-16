@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "outDir": "out",
+    "types": ["node"]
+  },
+  "include": [
+    "electron.vite.config.ts",
+    "electron/env.d.ts",
+    "electron/main/**/*",
+    "electron/preload/**/*"
+  ]
+}

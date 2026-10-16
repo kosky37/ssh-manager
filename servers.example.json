@@ -1,0 +1,20 @@
+[
+  {
+    "id": "home-server",
+    "name": "Home Server",
+    "host": "home-server",
+    "port": 22,
+    "username": "root",
+    "authType": "password",
+    "password": "YOUR_PASSWORD"
+  },
+  {
+    "id": "vps",
+    "name": "VPS",
+    "host": "203.0.113.10",
+    "port": 22,
+    "username": "ubuntu",
+    "authType": "privateKey",
+    "privateKeyPath": "C:/Users/you/.ssh/id_ed25519"
+  }
+]

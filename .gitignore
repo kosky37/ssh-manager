@@ -1,0 +1,17 @@
+node_modules/
+dist/
+out/
+release/
+*.log
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit credentials or private keys
+ssh keys/
+servers.json
+*.key
+*.pem
+*.ppk
+.env
+.env.*
+*.tsbuildinfo
